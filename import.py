@@ -458,7 +458,7 @@ def preprocess_c_with_macros(
 
     # Now, run the preprocessor again for real.
     source = subprocess.check_output(
-        CPP + STUB_FN_MACROS, cwd=cwd, encoding="utf-8", input=source
+        CPP + STUB_FN_MACROS + ["-dD"], cwd=cwd, encoding="utf-8", input=source
     )
 
     # Finally, find all function-like defines that we hid (some might have
@@ -467,12 +467,24 @@ def preprocess_c_with_macros(
     # the file. When the compiler runs, this section will be replaced by
     # the real defines and the preprocessor invoked once more.
     late_defines: List[Tuple[str, str]] = []
+    helper_defines: Dict[str, str] = {}
+    changing_helpers: Set[str] = set()
     lines: List[str] = []
     graph: Dict[str, Set[str]] = defaultdict(set)
-    reg_token = re.compile(r"[a-zA-Z0-9_]+")
+    # Quoted tokens and formal parameters do not name macro dependencies.
+    reg_token = re.compile(
+        r"(?:u8|[uUL])?(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+        r"|(?P<identifier>[a-zA-Z_][a-zA-Z0-9_]*)"
+    )
     for line in source.splitlines():
+        is_helper = line.startswith("#define ")
+        if is_helper:
+            line = "_permuter define " + line[len("#define ") :]
+        elif line.startswith("#undef "):
+            changing_helpers.add(line.split()[1])
+            continue
         is_macro = line.startswith("_permuter define ")
-        params = []
+        params: Set[str] = set()
         ignore = False
         if "_permuter_ignore_line " in line:
             line = line.replace("_permuter_ignore_line ", "")
@@ -486,9 +498,26 @@ def preprocess_c_with_macros(
             before = line[:ind]
             after = line[ind:]
             name = before.split()[2]
-            late_defines.append((name, after))
+            if is_helper:
+                # cpp reintroduces these built-ins after the first-pass filter.
+                # Retaining them can cause redefinition warnings at compilation.
+                if name.startswith("__STDC_"):
+                    continue
+                if name in helper_defines and helper_defines[name] != after:
+                    changing_helpers.add(name)
+                helper_defines[name] = after
+            else:
+                late_defines.append((name, after))
             if after.startswith("("):
-                params = [w.strip() for w in after[1 : after.find(")")].split(",")]
+                end_params = after.find(")")
+                params.update(
+                    re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", after[1:end_params])
+                )
+                if "..." in after[1:end_params]:
+                    params.add("__VA_ARGS__")
+                line = after[end_params + 1 :]
+            else:
+                line = after
         else:
             if ignore:
                 encoded = b64encode(line.encode("utf-8")).decode("ascii")
@@ -496,33 +525,51 @@ def preprocess_c_with_macros(
             else:
                 lines.append(line)
             name = ""
+        dependencies = graph[name]
         for m in reg_token.finditer(line):
-            name2 = m.group(0)
+            name2 = m.group("identifier")
+            if name2 is None or name2 in params:
+                continue
             has_wildcard = False
-            if is_macro and name2 not in params:
+            if is_macro:
                 wcbefore = line[: m.start()].rstrip().endswith("##")
                 wcafter = line[m.end() :].lstrip().startswith("##")
                 if wcbefore or wcafter:
-                    graph[name].add(name2 + "*")
+                    dependencies.add(name2 + "*")
                     has_wildcard = True
             if not has_wildcard:
-                graph[name].add(name2)
+                dependencies.add(name2)
 
-    # Prune away (recursively) unused macros, for cleanliness.
-    used_anywhere: Set[str] = set()
     used_by_nonmacro = graph[""]
-    queue = [""]
-    while queue:
-        name = queue.pop()
-        if name not in used_anywhere:
-            used_anywhere.add(name)
+    preserved_names = {name for name, _after in late_defines}
+
+    def macro_closure(include_helpers: bool) -> Set[str]:
+        used: Set[str] = set()
+        queue = list(used_by_nonmacro & preserved_names)
+        while queue:
+            name = queue.pop()
+            if name in used:
+                continue
+            used.add(name)
             if name.endswith("*"):
                 wildcard = name[:-1]
-                for name2 in graph:
-                    if wildcard in name2:
-                        queue.extend(graph[name2])
-            else:
+                queue.extend(name2 for name2 in graph if wildcard in name2)
+            elif include_helpers or name not in helper_defines:
                 queue.extend(graph[name])
+        return used
+
+    # A preserved macro may refer to a helper defined later. Keep the helper
+    # closure too, but only when moving it to the late-defines block cannot
+    # expand identifiers left in ordinary source or change a dynamic macro.
+    # Otherwise retain the existing preservation behavior for the whole closure.
+    used_anywhere = macro_closure(include_helpers=True)
+    helpers = used_anywhere & helper_defines.keys()
+    if helpers & (changing_helpers | used_by_nonmacro):
+        used_anywhere = macro_closure(include_helpers=False)
+    else:
+        late_defines.extend(
+            (name, after) for name, after in helper_defines.items() if name in helpers
+        )
 
     def get_decl(name: str, after: str) -> str:
         typ = preserve_type_fn(name)
@@ -531,7 +578,11 @@ def preprocess_c_with_macros(
         else:
             return f"extern {typ} {name};"
 
-    used_macros = [name for (name, _after) in late_defines if name in used_by_nonmacro]
+    used_macros = [
+        name
+        for name, _after in late_defines
+        if name in used_by_nonmacro and name in preserved_names
+    ]
 
     return (
         "\n".join(
@@ -544,7 +595,7 @@ def preprocess_c_with_macros(
             + [
                 get_decl(name, after)
                 for (name, after) in late_defines
-                if name in used_by_nonmacro
+                if name in used_by_nonmacro and name in preserved_names
             ]
             + ["#pragma _permuter latedefine end"]
             + lines
