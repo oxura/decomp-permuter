@@ -24,6 +24,7 @@ class TypeMap:
     var_types: Dict[str, Type] = field(default_factory=dict)
     local_vars: Set[str] = field(default_factory=set)
     struct_defs: Dict[str, StructUnion] = field(default_factory=dict)
+    implicit_functions: Set[str] = field(default_factory=set)
 
 
 def is_local_var(name: str, typemap: TypeMap) -> bool:
@@ -326,6 +327,19 @@ def build_typemap(ast: ca.FileAST, target_fn: ca.FuncDef) -> TypeMap:
                 within_fn = False
 
     Visitor().visit(ast)
+
+    class ImplicitFunctionVisitor(ca.NodeVisitor):
+        def visit_FuncCall(self, call: ca.FuncCall) -> None:
+            if isinstance(call.name, ca.ID) and call.name.name not in ret.var_types:
+                name = call.name.name
+                ret.var_types[name] = ca.FuncDecl(args=None, type=basic_type("int"))
+                ret.implicit_functions.add(name)
+            self.generic_visit(call)
+
+    # Infer old-style implicit declarations only after collecting explicit
+    # types, including local declarations and function pointer parameters.
+    # Keep these in the type map rather than changing the generated C.
+    ImplicitFunctionVisitor().visit(target_fn)
     return ret
 
 

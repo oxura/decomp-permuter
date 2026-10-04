@@ -1,11 +1,13 @@
 import copy
 from dataclasses import dataclass, field
 import functools
+import warnings
 from typing import Mapping, Optional, Tuple
 
 from perm_pycparser import c_ast as ca
 
 from .compiler import Compiler
+from .ast_types import build_typemap
 from .randomizer import Randomizer
 from .scorer import Scorer
 from .perm.perm import EvalState
@@ -50,6 +52,11 @@ class Candidate:
         ast = ast_util.parse_c(source)
         orig_fn, fn_index = ast_util.extract_fn(ast, fn_name)
         ast_util.normalize_ast(orig_fn, ast)
+        for name in sorted(build_typemap(ast, orig_fn).implicit_functions):
+            warnings.warn(
+                f"Function {name} has no declaration; assuming it returns int.",
+                RuntimeWarning,
+            )
         return orig_fn, fn_index, ast
 
     @staticmethod
