@@ -663,8 +663,9 @@ def perm_temp_for_expr(
         past_decls = False
         for index, stmt in enumerate(stmts):
             if isinstance(stmt, ca.Decl):
-                assert stmt.name, "Anonymous declarations cannot happen in functions"
-                if not isinstance(stmt.type, ca.ArrayDecl):
+                # A standalone struct/union/enum declaration introduces a type,
+                # not a variable that can hold a temporary expression.
+                if stmt.name and not isinstance(stmt.type, ca.ArrayDecl):
                     reuse_cands.append(stmt.name)
                     if not isinstance(stmt.type, ca.PtrDecl):
                         # Make non-pointers more common
