@@ -198,10 +198,6 @@ def compute_write_locations(
     def add_write(var_name: str, loc: int) -> None:
         if var_name not in writes:
             writes[var_name] = []
-        else:
-            assert (
-                loc > writes[var_name][-1]
-            ), "consistent traversal order should guarantee monotonicity here"
         writes[var_name].append(loc)
 
     class Visitor(ca.NodeVisitor):
@@ -221,6 +217,9 @@ def compute_write_locations(
             self.generic_visit(node)
 
     Visitor().visit(top_node)
+    for locs in writes.values():
+        locs.sort()
+    add_loop_access_locations(top_node, indices, writes, is_write=True)
     return writes
 
 
@@ -231,12 +230,48 @@ def compute_read_locations(top_node: ca.Node, indices: Indices) -> Dict[str, Lis
         loc = indices.starts[node]
         if var_name not in reads:
             reads[var_name] = []
-        else:
-            assert (
-                loc > reads[var_name][-1]
-            ), "consistent traversal order should guarantee monotonicity here"
         reads[var_name].append(loc)
+    for locs in reads.values():
+        locs.sort()
+    add_loop_access_locations(top_node, indices, reads, is_write=False)
     return reads
+
+
+def add_loop_access_locations(
+    top_node: ca.Node,
+    indices: Indices,
+    locations: Dict[str, List[int]],
+    *,
+    is_write: bool,
+) -> None:
+    """Conservatively account for accesses in other loop iterations.
+
+    A for initializer runs once, so only accesses after it are loop-carried.
+    At each boundary, reads precede writes: a value may still be needed before
+    a subsequent iteration overwrites it, or after a loop that never ran.
+    """
+    additions: Dict[str, List[int]] = {}
+
+    class Visitor(ca.NodeVisitor):
+        def generic_visit(self, node: ca.Node) -> None:
+            if isinstance(node, (ca.For, ca.While, ca.DoWhile)):
+                start = (
+                    indices.ends[node.init]
+                    if isinstance(node, ca.For) and node.init
+                    else indices.starts[node]
+                )
+                end = indices.ends[node]
+                for name, locs in locations.items():
+                    first = bisect.bisect_right(locs, start)
+                    if first < len(locs) and locs[first] < end:
+                        additions.setdefault(name, []).extend(
+                            [start + 1, end] if is_write else [start, end - 1]
+                        )
+            super().generic_visit(node)
+
+    Visitor().visit(top_node)
+    for name, locs in additions.items():
+        locations[name] = sorted(set(locations[name] + locs))
 
 
 def find_var_reads(top_node: ca.Node) -> List[ca.ID]:
@@ -260,8 +295,11 @@ def find_var_reads(top_node: ca.Node) -> List[ca.ID]:
 
         def visit_Assignment(self, node: ca.Assignment) -> None:
             if isinstance(node.lvalue, ca.ID):
-                return
-            self.generic_visit(node)
+                if node.op != "=":
+                    self.visit(node.lvalue)
+                self.visit(node.rvalue)
+            else:
+                self.generic_visit(node)
 
     Visitor().visit(top_node)
     return ret
@@ -334,6 +372,9 @@ def visit_replace(top_node: ca.Node, callback: Callable[[ca.Node, bool], Any]) -
         elif isinstance(node, ca.Decl):
             if node.init:
                 node.init = rec(node.init, isinstance(node.init, ca.InitList))
+        elif isinstance(node, ca.DeclList):
+            for i, decl in enumerate(node.decls):
+                node.decls[i] = rec(decl, True)
         elif isinstance(node, ca.For):
             if node.init:
                 node.init = empty_statement_to_none(rec(node.init, True))
@@ -827,10 +868,17 @@ def perm_expand_expr(
     all_reads: Dict[str, List[int]] = compute_read_locations(fn, indices)
 
     # Step 1: pick out a variable to replace
+    replaceable_reads: Set[int] = set()
+
+    def collect_read(expr: Expression) -> None:
+        if isinstance(expr, ca.ID):
+            replaceable_reads.add(indices.starts[expr])
+
+    replace_subexprs(fn.body, collect_read)
     rev: Dict[int, str] = {}
     for var, locs in all_reads.items():
         for index in locs:
-            if region.contains_pre_index(index):
+            if index in replaceable_reads and region.contains_pre_index(index):
                 rev[index] = var
     ensure(rev)
     index = random.choice(list(rev.keys()))
@@ -845,7 +893,8 @@ def perm_expand_expr(
     before = writes[i - 1]
     after = MAX_INDEX if i == len(writes) else writes[i]
     rev_indices = reverse_start_indices(indices)
-    write = rev_indices[before]
+    # A loop-carried write has no corresponding assignment to substitute.
+    write = rev_indices.get(before)
     if (
         isinstance(write, ca.Decl)
         and write.init
@@ -857,9 +906,19 @@ def perm_expand_expr(
     else:
         raise RandomizationFailure
 
+    # Assignment indices precede RHS evaluation. A read inside this write
+    # still uses the old value, and self-referential updates cannot be copied
+    # after a retained assignment without changing that value a second time.
+    ensure(indices.ends[write] < index)
+    ensure(all(read.name != var for read in find_var_reads(repl_expr)))
+
     # Step 3: pick of the range of variables to replace
     repl_cands = [
-        i for i in reads if before < i < after and region.contains_pre_index(i)
+        i
+        for i in reads
+        if indices.ends[write] < i < after
+        and i in replaceable_reads
+        and region.contains_pre_index(i)
     ]
     assert repl_cands, "index is always in repl_cands"
     myi = repl_cands.index(index)
@@ -876,6 +935,11 @@ def perm_expand_expr(
     else:
         keep_var = random_bool(random, PROB_KEEP_REPLACED_VAR)
     repl_cands_set = set(repl_cands)
+    # Other reads in this write's interval, including loop-carried reads and
+    # reads outside the active region, still need the assigned value.
+    keep_var = keep_var or any(
+        before < i < after and i not in repl_cands_set for i in reads
+    )
 
     # Don't duplicate effectful expressions.
     if ast_util.is_effectful(repl_expr):

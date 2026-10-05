@@ -164,7 +164,18 @@ def compute_node_indices(top_node: ca.Node) -> Indices:
             assert node not in starts, "nodes should only appear once in AST"
             starts[node] = cur_index
             cur_index += 2
-            super().generic_visit(node)
+            # Follow the order within one iteration, rather than the order of
+            # pycparser's fields (which put a for increment before its body,
+            # and a do-while condition before its body).
+            if isinstance(node, ca.For):
+                for child in (node.init, node.cond, node.stmt, node.next):
+                    if child:
+                        self.visit(child)
+            elif isinstance(node, ca.DoWhile):
+                self.visit(node.stmt)
+                self.visit(node.cond)
+            else:
+                super().generic_visit(node)
             ends[node] = cur_index
             cur_index += 2
 
@@ -447,6 +458,7 @@ def deduplicate_typedefs(ast: ca.FileAST) -> None:
             self.generic_visit(node)
 
     DeclVisitor().visit(ast)
+
 
 def prune_ast(fn: ca.FuncDef, ast: ca.FileAST) -> int:
     """Prune away unnecessary parts of the AST, to reduce overhead from serialization
