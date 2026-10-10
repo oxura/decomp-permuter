@@ -1,4 +1,4 @@
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, Iterator, List, Match, Pattern, Tuple
 import re
 
 from .perm import (
@@ -18,24 +18,42 @@ from .perm import (
     VarPerm,
 )
 
+# Consume entire C literals/comments before looking for macro syntax. Retain
+# their original text; only punctuation and complete PERM identifiers are syntax.
+_C_TEXT = r"""
+    "(?:\\[\s\S]|[^"\\])*" | '(?:\\[\s\S]|[^'\\])*'
+    | /\*[\s\S]*?\*/ | //(?:\\\r?\n|[^\n])*
+    | (?P<unterminated>["']|/\*)
+"""
+_ARG_SYNTAX = re.compile(_C_TEXT + r"|(?P<syntax>[(),])", re.VERBOSE)
+_MACRO_SYNTAX = re.compile(_C_TEXT + r"|(?P<macro>\bPERM_[A-Za-z0-9_]+)\(", re.VERBOSE)
+
+
+def _syntax_matches(pattern: Pattern[str], text: str) -> Iterator[Match[str]]:
+    for match in pattern.finditer(text):
+        if match.lastgroup == "unterminated":
+            raise Exception("Unterminated C literal or comment in PERM input")
+        if match.lastgroup is not None:
+            yield match
+
 
 def _split_by_comma(text: str) -> List[str]:
     level = 0
-    current = ""
+    start = 0
     args: List[str] = []
-    for c in text:
+    for match in _syntax_matches(_ARG_SYNTAX, text):
+        c = match.group("syntax")
         if c == "," and level == 0:
-            args.append(current)
-            current = ""
+            args.append(text[start : match.start()])
+            start = match.end()
         else:
             if c == "(":
                 level += 1
             elif c == ")":
                 level -= 1
                 assert level >= 0, "Bad nesting"
-            current += c
     assert level == 0, "Mismatched parentheses"
-    args.append(current)
+    args.append(text[start:])
     return args
 
 
@@ -91,23 +109,23 @@ PERM_FACTORIES: Dict[str, Callable[[str], Perm]] = {
 
 def _consume_arg_parens(text: str) -> Tuple[str, str]:
     level = 0
-    for i, c in enumerate(text):
+    for match in _syntax_matches(_ARG_SYNTAX, text):
+        c = match.group("syntax")
         if c == "(":
             level += 1
         elif c == ")":
             level -= 1
             if level == -1:
-                return text[:i], text[i + 1 :]
+                return text[: match.start()], text[match.end() :]
     raise Exception("Failed to find closing parenthesis when parsing PERM macro")
 
 
 def _rec_perm_parse(text: str) -> Perm:
     remain = text
-    macro_search = r"(PERM_.+?)\("
 
     perms: List[Perm] = []
     while len(remain) > 0:
-        match = re.search(macro_search, remain)
+        match = next(_syntax_matches(_MACRO_SYNTAX, remain), None)
 
         # No match found; return remaining
         if match is None:
@@ -116,7 +134,7 @@ def _rec_perm_parse(text: str) -> Perm:
             break
 
         # Get perm type and args
-        perm_type = match.group(1)
+        perm_type = match.group("macro")
         if perm_type not in PERM_FACTORIES:
             raise Exception("Unrecognized PERM macro: " + perm_type)
         between = remain[: match.start()]

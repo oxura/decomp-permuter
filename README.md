@@ -54,7 +54,7 @@ The .c file may be modified with any of the following macros which affect manual
 - `PERM_PRETEND(code)` expands to `code` for the purpose of the C parser/randomizer, but gets removed afterwards. This can be used together with `PERM_IGNORE` to enable the permuter to deal with input it isn't designed for (e.g. inline functions, C++, non-code).
 - `PERM_ONCE([key,] code)` expands to either `code` or to nothing, such that each unique key gets expanded exactly once. `key` defaults to `code`. For example, `PERM_ONCE(a;) b; PERM_ONCE(a;)` expands to either `a; b;` or `b; a;`.
 
-Arguments are split by a commas, exluding commas inside parenthesis. `(,)` is a special escape sequence that resolves to `,`. 
+Arguments are split at commas outside nested parentheses, C string and character literals, and comments. `PERM_*` text inside literals or comments is not expanded. `(,)` remains a special escape sequence that resolves to `,`.
 
 Nested macros are allowed, so e.g.
 ```
